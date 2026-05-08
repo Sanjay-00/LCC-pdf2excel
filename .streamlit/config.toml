@@ -6,7 +6,6 @@ textColor          = "#1A1A2E"
 font               = "sans serif"
 
 [server]
-port               = 8502
 maxUploadSize      = 200          # MB — supports large multi-page PDFs
 enableCORS         = false
 headless           = true
