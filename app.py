@@ -251,9 +251,9 @@ if files:
             buf.seek(0)
 
             st.download_button(
-                "⬇ Download Master Excel",
+                "⬇ Download Master LCC",
                 data=buf.getvalue(),
-                file_name="master_loan_report.xlsx",
+                file_name="Master_LCC.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             )
 
