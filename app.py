@@ -253,7 +253,7 @@ with col_up:
 
 with col_info:
     st.markdown("""
-    <div style="background:#f8fafd;border:1px solid #d0e4f7;border-radius:10px;padding:1rem 1.2rem;margin-top:0.2rem">
+    <div style="background:#f8fafd;border:1px solid #d0e4f7;border-radius:10px;padding:0.8rem 1.2rem;margin-top:0.2rem">
     <b>📋 How it works</b><br><br>
     1. Upload one or more <b>LCC in PDF format</b><br>
     2. Click <b>Convert to Excel</b><br>
