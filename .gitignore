@@ -1,0 +1,21 @@
+# Virtual environment
+p2e/
+venv/
+env/
+.env
+
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Claude Code settings
+.claude/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Downloaded/output files
+*.xlsx
+*.pdf

@@ -1,0 +1,15 @@
+[theme]
+primaryColor       = "#2E75B6"
+backgroundColor    = "#FFFFFF"
+secondaryBackgroundColor = "#F0F4F8"
+textColor          = "#1A1A2E"
+font               = "sans serif"
+
+[server]
+port               = 8502
+maxUploadSize      = 200          # MB — supports large multi-page PDFs
+enableCORS         = false
+headless           = true
+
+[browser]
+gatherUsageStats   = false
