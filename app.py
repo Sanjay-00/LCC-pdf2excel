@@ -7,8 +7,39 @@ import pandas as pd
 import streamlit as st
 from lxml import html as lxml_html
 
-st.set_page_config(page_title="PDF to Excel", layout="wide")
-st.title("PDF → Master Excel")
+st.set_page_config(page_title="LCC PDF to Excel", page_icon="📊", layout="wide")
+
+st.markdown("""
+<style>
+.hero {
+    background: linear-gradient(135deg, #1a3c5e 0%, #2e75b6 100%);
+    padding: 2rem 2.5rem;
+    border-radius: 14px;
+    margin-bottom: 2rem;
+}
+.hero h1 { color: #ffffff; font-size: 2.2rem; font-weight: 700; margin: 0; }
+.hero p  { color: #cce0f5; font-size: 1rem; margin: 0.4rem 0 0 0; }
+.stat-box {
+    background: #f0f6ff;
+    border: 1px solid #c5d8f0;
+    border-radius: 10px;
+    padding: 1rem 1.5rem;
+    text-align: center;
+}
+.stat-box h3 { color: #1a3c5e; font-size: 1.8rem; margin: 0; }
+.stat-box p  { color: #4a6fa5; font-size: 0.8rem; margin: 0; font-weight: 600; text-transform: uppercase; }
+div[data-testid="stDownloadButton"] button {
+    background: #1a3c5e; color: white; border-radius: 8px;
+    font-weight: 600; width: 100%; font-size: 1rem; padding: 0.6rem;
+}
+div[data-testid="stDownloadButton"] button:hover { background: #2e75b6; color: white; }
+</style>
+
+<div class="hero">
+    <h1>📑 LCC: PDF to Master Excel</h1>
+    <p>Upload ALL RE's PDFs · Get one consolidated Excel file as Master LCC</p>
+</div>
+""", unsafe_allow_html=True)
 
 # ── Fixed schema — 85 columns in exact order ──────────────────────────────────
 EXPECTED_COLS = [
@@ -210,12 +241,31 @@ def pdf_to_dataframe(file_bytes: bytes) -> pd.DataFrame:
 
 
 # ── Streamlit UI ──────────────────────────────────────────────────────────────
-files = st.file_uploader("Upload PDF files", type="pdf", accept_multiple_files=True)
+col_up, col_info = st.columns([2, 1])
+
+with col_up:
+    files = st.file_uploader(
+        "Drop PDF files here or click Upload",
+        type="pdf",
+        accept_multiple_files=True,
+        label_visibility="visible",
+    )
+
+with col_info:
+    st.markdown("""
+    <div style="background:#f8fafd;border:1px solid #d0e4f7;border-radius:10px;padding:1rem 1.2rem;margin-top:0.2rem">
+    <b>📋 How it works</b><br><br>
+    1. Upload one or more <b>LCC in PDF format</b><br>
+    2. Click <b>Convert to Excel</b><br>
+    3. Download the master Excel file<br><br>
+    <span style="color:#4a6fa5;font-size:0.85rem"> 85 fixed columns &nbsp;|&nbsp;  All RE's data merged</span>
+    </div>
+    """, unsafe_allow_html=True)
 
 if files:
-    st.info(f"{len(files)} file(s) selected")
+    st.info(f"**{len(files)} file(s) selected:** " + ", ".join(f.name for f in files))
 
-    if st.button("Convert to Excel", type="primary"):
+    if st.button("▶  Convert to Excel", type="primary", use_container_width=True):
         dfs:    list[pd.DataFrame] = []
         failed: list[str]          = []
         bar = st.progress(0)
@@ -226,21 +276,28 @@ if files:
                 df = pdf_to_dataframe(f.read())
                 if df.empty or df.shape[1] == 0:
                     failed.append(f.name)
-                    st.warning(f"No table found in {f.name}")
+                    st.warning(f"⚠ No table found in {f.name}")
                 else:
                     dfs.append(df)
-                    st.success(f"✓ {f.name} — {len(df):,} rows, {len(df.columns)} cols")
+                    st.success(f"✔ {f.name} — {len(df):,} rows extracted")
             except Exception as e:
                 failed.append(f.name)
                 st.error(f"✗ {f.name}: {e}")
 
-        bar.progress(1.0, text="Done")
+        bar.progress(1.0, text="Done!")
 
         if dfs:
             master = pd.concat(dfs, ignore_index=True)
-            st.markdown(
-                f"**Master: {len(master):,} rows × {len(master.columns)} columns**"
-            )
+
+            st.divider()
+
+            # Summary metrics
+            m1, m2, m3 = st.columns(3)
+            m1.markdown(f'<div class="stat-box"><h3>{len(files)}</h3><p>PDFs Processed</p></div>', unsafe_allow_html=True)
+            m2.markdown(f'<div class="stat-box"><h3>{len(master):,}</h3><p>Total Rows</p></div>', unsafe_allow_html=True)
+            m3.markdown(f'<div class="stat-box"><h3>{len(master.columns)}</h3><p>Columns</p></div>', unsafe_allow_html=True)
+
+            st.markdown(f"#### Preview — first 20 rows of {len(master):,} total")
             st.dataframe(master.head(20), use_container_width=True)
 
             master = master.fillna("").astype(str).replace("nan", "")
@@ -250,12 +307,14 @@ if files:
                 master.to_excel(w, index=False, sheet_name="Master")
             buf.seek(0)
 
+            st.divider()
             st.download_button(
-                "⬇ Download Master LCC",
+                "⬇  Download Master LCC Excel",
                 data=buf.getvalue(),
                 file_name="Master_LCC.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
             )
 
         if failed:
-            st.error(f"Failed: {', '.join(failed)}")
+            st.error(f"Failed PDFs: {', '.join(failed)}")
