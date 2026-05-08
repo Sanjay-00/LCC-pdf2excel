@@ -7,7 +7,7 @@ import pandas as pd
 import streamlit as st
 from lxml import html as lxml_html
 
-st.set_page_config(page_title="LCC PDF to Excel", page_icon="📊", layout="wide")
+st.set_page_config(page_title="LCC PDF to Excel", page_icon="🗐", layout="wide")
 
 st.markdown("""
 <style>
