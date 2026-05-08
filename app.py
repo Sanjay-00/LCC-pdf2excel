@@ -279,7 +279,7 @@ if files:
                     st.warning(f"⚠ No table found in {f.name}")
                 else:
                     dfs.append(df)
-                    st.success(f"✔ {f.name} — {len(df):,} rows extracted")
+                    st.success(f"✔ {f.name} -  {len(df):,} rows & {len(df.columns)} columns extracted")
             except Exception as e:
                 failed.append(f.name)
                 st.error(f"✗ {f.name}: {e}")
