@@ -223,7 +223,7 @@ def pdf_to_dataframe(file_bytes: bytes) -> pd.DataFrame:
             items = sorted(row_map[y], key=lambda x: x[0])
             if not items or len(items) < 5:
                 continue
-            if items[0][1] == "0" and any("ZTotal" in t for _, t in items):
+            if any("ZTotal" in t for _, t in items):
                 continue
             row = _assign_boundary(items, col_xs)
             if any(row):
