@@ -261,7 +261,7 @@ with col_info:
     1. Upload one or more <b>LCC in PDF format</b><br>
     2. Click <b>Convert to Excel</b><br>
     3. Download the master Excel file<br><br>
-    <span style="color:#4a6fa5;font-size:0.85rem"> 85 fixed columns &nbsp;|&nbsp;  All RE's data merged</span>
+    <span style="color:#4a6fa5;font-size:0.85rem"> 85 fixed columns &nbsp;|&nbsp;  All REs data merged</span>
     </div>
     """, unsafe_allow_html=True)
 
