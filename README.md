@@ -56,19 +56,8 @@ pip install -r requirements.txt
 streamlit run app.py
 ```
 
-The app opens at **http://localhost:8501**
 
----
 
-## Deploy to Streamlit Cloud
-
-1. Push this project to a **GitHub repository**
-2. Go to [share.streamlit.io](https://share.streamlit.io) and sign in
-3. Click **New app** → select your repo
-4. Set **Main file path** to `app.py`
-5. Click **Deploy** — done
-
-Streamlit Cloud automatically reads `requirements.txt`.
 
 ---
 
