@@ -51,6 +51,17 @@ Each page gets its own coordinate space. Column structure is learned from the fi
 | Total row | Automatically excluded |
 | Multiple PDFs | All rows merged into one sheet |
 
+## Screenshots
+
+**Landing page**
+![Landing page](screenshots/before_uploading.png)
+
+**PDFs selected, ready to convert**
+![Files selected](screenshots/after_uploading.png)
+
+**After extraction — 7 PDFs, 832 rows, 85 columns**
+![After extraction](screenshots/after_extraction.png)
+
 ## Tech Stack
 
 | | |
