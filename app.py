@@ -192,45 +192,47 @@ def _assign_boundary(items: list[tuple], col_xs: list[float]) -> list[str]:
 def pdf_to_dataframe(file_bytes: bytes) -> pd.DataFrame:
     doc = fitz.open(stream=file_bytes, filetype="pdf")
 
-    all_para: list[tuple[float, float, str]] = []
+    col_xs: list[float] | None = None
+    data: list[list[str]] = []
+
     for page in doc:
-        all_para.extend(_parse_html_paragraphs(page))
+        paragraphs = _parse_html_paragraphs(page)
+        row_map    = _group_by_row(paragraphs)
+
+        # Find header row on this page (Y coords reset to 0 on each page)
+        page_header_items = None
+        page_header_y: float | None = None
+        for y in sorted(row_map):
+            items = sorted(row_map[y], key=lambda x: x[0])
+            if HEADER_SIGNAL & {t for _, t in items}:
+                page_header_items = items
+                page_header_y     = y
+                break
+
+        # Learn column positions once from the first page that has a header
+        if page_header_items is not None and col_xs is None:
+            col_xs = _build_col_xs(page_header_items, row_map, page_header_y)
+
+        if col_xs is None:
+            continue
+
+        # Extract data rows from this page
+        for y in sorted(row_map):
+            if page_header_y is not None and abs(y - page_header_y) <= Y_TOL:
+                continue
+            items = sorted(row_map[y], key=lambda x: x[0])
+            if not items or len(items) < 5:
+                continue
+            if items[0][1] == "0" and any("ZTotal" in t for _, t in items):
+                continue
+            row = _assign_boundary(items, col_xs)
+            if any(row):
+                data.append(row)
+
     doc.close()
 
-    row_map = _group_by_row(all_para)
-
-    # Find header row
-    header_items: list | None = None
-    header_y: float | None    = None
-    for y in sorted(row_map):
-        items = sorted(row_map[y], key=lambda x: x[0])
-        if HEADER_SIGNAL & {t for _, t in items}:
-            header_items = items
-            header_y     = y
-            break
-
-    if header_y is None or header_items is None:
+    if col_xs is None:
         return pd.DataFrame(columns=EXPECTED_COLS)
-
-    # Build column X positions: data rows for accuracy + header for empty columns
-    col_xs = _build_col_xs(header_items, row_map, header_y)
-
-    if not col_xs:
-        return pd.DataFrame(columns=EXPECTED_COLS)
-
-    # Extract data rows
-    data: list[list[str]] = []
-    for y in sorted(row_map):
-        if abs(y - header_y) <= Y_TOL:
-            continue
-        items = sorted(row_map[y], key=lambda x: x[0])
-        if not items or len(items) < 5:          # skip title/separator rows
-            continue
-        if items[0][1] == "0" and any("ZTotal" in t for _, t in items):
-            continue
-        row = _assign_boundary(items, col_xs)
-        if any(row):
-            data.append(row)
 
     n = len(col_xs)
     df = pd.DataFrame(
@@ -300,7 +302,16 @@ if files:
             st.markdown(f"#### Preview — first 20 rows of {len(master):,} total")
             st.dataframe(master.head(20), use_container_width=True)
 
-            master = master.fillna("").astype(str).replace("nan", "")
+            master = master.fillna("")
+            for col in master.columns:
+                non_empty = master[col] != ""
+                if not non_empty.any():
+                    continue
+                numeric = pd.to_numeric(master[col].replace("", pd.NA), errors="coerce")
+                if numeric[non_empty].notna().all():
+                    master[col] = numeric
+                else:
+                    master[col] = master[col].astype(str)
 
             buf = io.BytesIO()
             with pd.ExcelWriter(buf, engine="openpyxl") as w:
