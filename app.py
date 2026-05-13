@@ -67,6 +67,7 @@ EXPECTED_COLS = [
     "CUSTOMER_STATUS","LGL_FLAG","LGL_DESCRIPTION","TyreFlag","FUEL_TYPE",
 ]
 
+DATE_COLS     = {"Ag_Date", "Due Dt", "Last Receipt Date", "ParentLDueDate"}
 HEADER_SIGNAL = {"SNo", "CHANNEL", "Tenure"}
 Y_TOL         = 3.0
 N_COLS        = len(EXPECTED_COLS)   # 85
@@ -304,6 +305,11 @@ if files:
 
             master = master.fillna("")
             for col in master.columns:
+                if col in DATE_COLS:
+                    master[col] = pd.to_datetime(
+                        master[col].replace("", pd.NA), dayfirst=True, errors="coerce"
+                    )
+                    continue
                 non_empty = master[col] != ""
                 if not non_empty.any():
                     continue
@@ -316,6 +322,12 @@ if files:
             buf = io.BytesIO()
             with pd.ExcelWriter(buf, engine="openpyxl") as w:
                 master.to_excel(w, index=False, sheet_name="Master")
+                ws = w.sheets["Master"]
+                for col_idx, col_name in enumerate(master.columns, start=1):
+                    if col_name in DATE_COLS:
+                        col_letter = ws.cell(1, col_idx).column_letter
+                        for cell in ws[col_letter][1:]:
+                            cell.number_format = "DD-MM-YYYY"
             buf.seek(0)
 
             st.divider()
