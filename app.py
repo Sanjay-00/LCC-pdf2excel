@@ -67,7 +67,7 @@ EXPECTED_COLS = [
     "CUSTOMER_STATUS","LGL_FLAG","LGL_DESCRIPTION","TyreFlag","FUEL_TYPE",
 ]
 
-DATE_COLS     = {"Ag_Date", "Due Dt", "Last Receipt Date", "ParentLDueDate"}
+DATE_COLS     = {"Ag_Date", "Last Receipt Date", "ParentLDueDate"}
 HEADER_SIGNAL = {"SNo", "CHANNEL", "Tenure"}
 Y_TOL         = 3.0
 N_COLS        = len(EXPECTED_COLS)   # 85
