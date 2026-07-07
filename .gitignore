@@ -12,6 +12,9 @@ __pycache__/
 # Claude Code settings
 .claude/
 
+# Local secrets (not committed — see .streamlit/secrets.toml.example)
+.streamlit/secrets.toml
+
 # OS files
 .DS_Store
 Thumbs.db
@@ -19,3 +22,4 @@ Thumbs.db
 # Downloaded/output files
 *.xlsx
 *.pdf
+GUIDE.md
