@@ -19,3 +19,7 @@ Thumbs.db
 # Downloaded/output files
 *.xlsx
 *.pdf
+GUIDE.md
+
+# Local secrets
+.streamlit/secrets.toml
