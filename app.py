@@ -423,7 +423,7 @@ if files:
                 else:
                     master[col] = master[col].astype(str)
 
-            st.markdown(f"#### Preview — first 20 rows of {len(master):,} total")
+            st.markdown(f"#### Preview: first 20 rows of {len(master):,} total")
             preview = master.head(20).copy()
             for col in DATE_COLS:
                 if col in preview.columns:
