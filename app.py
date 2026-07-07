@@ -7,8 +7,6 @@ import pandas as pd
 import streamlit as st
 from lxml import html as lxml_html
 
-from report_issue import render_report_issue
-
 st.set_page_config(page_title="LCC PDF to Excel", page_icon="🗐", layout="wide")
 
 st.markdown("""
@@ -425,7 +423,7 @@ if files:
                 else:
                     master[col] = master[col].astype(str)
 
-            st.markdown(f"#### Preview: first 20 rows of {len(master):,} total")
+            st.markdown(f"#### Preview — first 20 rows of {len(master):,} total")
             preview = master.head(20).copy()
             for col in DATE_COLS:
                 if col in preview.columns:
@@ -454,5 +452,3 @@ if files:
 
         if failed:
             st.error(f"Failed PDFs: {', '.join(failed)}")
-
-render_report_issue()
