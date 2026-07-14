@@ -4,7 +4,7 @@ A Streamlit tool that reconstructs tabular data out of position-only PDF reports
 multiple files into one type-correct Excel workbook, replacing a manual, error-prone,
 several-times-a-month process with a single click.
 
-**Live App:** [lcc-pdf2excel.streamlit.app](https://lcc-pdf-to-excel.streamlit.app/)
+**Live App:** [lcc-pdf2excel.streamlit.app](https://lcc-pdf2excel.streamlit.app/)
 
 ---
 
