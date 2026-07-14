@@ -23,3 +23,5 @@ GUIDE.md
 
 # Local secrets
 .streamlit/secrets.toml
+
+ARCHITECTURE.md
