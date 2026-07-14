@@ -15,7 +15,7 @@ It was time-consuming, error-prone, and entirely manual.
 
 **This tool eliminates that entirely.** Upload all the PDFs at once, click Convert, download one consolidated Master LCC Excel in minutes, accurate enough to run daily if needed.
 
-**Live App** [lcc-pdf2excel.streamlit.app](https://lcc-pdf-to-excel.streamlit.app/)
+**Live App** [lcc-pdf2excel.streamlit.app](https://lcc-pdf2excel.streamlit.app/)
 
 ## The Challenge
 
