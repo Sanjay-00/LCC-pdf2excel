@@ -96,7 +96,6 @@ def _parse_date_col(series: pd.Series) -> pd.Series:
     return result
 HEADER_SIGNAL = {"SNo", "CHANNEL", "Tenure"}
 Y_TOL         = 3.0
-N_COLS        = len(EXPECTED_COLS)   # 85
 
 
 def _parse_html_paragraphs(page) -> list[tuple[float, float, str]]:
@@ -357,7 +356,7 @@ with col_info:
     1. Upload one or more <b>LCC in PDF format</b><br>
     2. Click <b>Convert to Excel</b><br>
     3. Download the master Excel file<br><br>
-    <span style="color:#4a6fa5;font-size:0.85rem"> 91 fixed columns &nbsp;|&nbsp;  All REs data merged</span>
+    <span style="color:#4a6fa5;font-size:0.85rem"> 91 columns detected this month, auto-adapts if more get added &nbsp;|&nbsp;  All REs data merged</span>
     </div>
     """, unsafe_allow_html=True)
 
