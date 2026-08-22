@@ -41,7 +41,7 @@ div[data-testid="stDownloadButton"] button:hover { background: #2e75b6; color: w
 </div>
 """, unsafe_allow_html=True)
 
-# ── Fixed schema — 85 columns in exact order ──────────────────────────────────
+# ── Fixed schema — 91 columns in exact order ──────────────────────────────────
 EXPECTED_COLS = [
     "SNo","Loan No","CHANNEL","BU","StateName","Zone","RegionName","Unit","Ag_Date",
     "SRC Code","SRC Name","MNT CODE","MNT NAME","Due Dt","Tenure","Loan Status",
@@ -65,6 +65,10 @@ EXPECTED_COLS = [
     "Last Receipt Date","Last Receipt Amount","ParentLDueDate",
     "No Coll 3 Months and >6 EMI","NACHStatus","SaleType","CoLending_Loans",
     "CUSTOMER_STATUS","LGL_FLAG","LGL_DESCRIPTION","TyreFlag","FUEL_TYPE",
+    # Added after the report template grew these 6 trailing fields — now a
+    # stable part of every export, not one-off drift.
+    "NPA_Date","NPA Status","For The Month Arrears","Paymethod",
+    "Security_Type","Arrears Loan Count",
 ]
 
 DATE_COLS     = {"Ag_Date", "Last Receipt Date", "ParentLDueDate", "NPA_Date"}
@@ -173,38 +177,77 @@ def _data_clusters(row_map: dict, header_y: float,
     return clusters
 
 
-def _build_col_xs(header_items: list, row_map: dict, header_y: float) -> list[float]:
+def _header_words(page, header_y: float) -> list[tuple[float, str]]:
+    """Word-level (left, text) tokens for the header row, sorted by X.
+
+    Word extraction splits strictly on whitespace, so it never fuses two
+    adjacent header labels together the way paragraph-mode clustering can
+    when they sit close enough (e.g. "CHANNEL" and "BU" merging into one
+    "CHANNEL BU" block) — that fusion is what col-position learning needs
+    to avoid.
+    """
+    word_row_map = _group_by_row(_parse_words(page))
+    for y, items in word_row_map.items():
+        if abs(y - header_y) <= Y_TOL:
+            return sorted(items, key=lambda x: x[0])
+    return []
+
+
+def _build_col_xs(header_items: list, header_words: list[tuple[float, str]],
+                   row_map: dict, header_y: float) -> list[float]:
     """
     Build the list of column X positions.
 
-    Strategy:
-    1. Learn positions from data rows (accurate, handles dynamic column widths,
-       but misses columns that are entirely empty in this PDF).
-    2. Supplement with header X positions for any column that had no data —
-       those columns will remain empty in the output, but their X slot must
-       exist so subsequent columns aren't shifted by one position.
-    3. Sort.
+    Primary strategy: derive each known column's X directly from the header
+    row's word-level tokens, consuming EXPECTED_COLS[i].split() tokens per
+    column in order and taking the first token's X as that column's start.
+    Word-level extraction never fuses across a cell boundary, so this stays
+    correct even on reports where paragraph-mode clustering fuses adjacent
+    cells — both header labels and, on some files, data values too (long
+    values sitting close enough that entire columns never appear as a
+    distinct cluster even after scanning every data row).
 
-    Not capped to a fixed column count: report templates occasionally add new
-    trailing fields, and truncating here would silently drop them.
+    Falls back to the old data-row-clustering approach if the header row
+    doesn't tokenize into at least as many words as the known schema needs
+    (e.g. a differently-worded template).
+
+    Not capped to a fixed column count: trailing new fields beyond the
+    known schema are still detected from data-row clustering, since we
+    don't know their word width in advance.
     """
-    header_xs = [x for x, _ in header_items]
-    data_xs   = _data_clusters(row_map, header_y)
+    core_xs: list[float] = []
+    idx = 0
+    for label in EXPECTED_COLS:
+        n = len(label.split()) or 1
+        if idx + n > len(header_words):
+            core_xs = []
+            break
+        core_xs.append(header_words[idx][0])
+        idx += n
 
-    if not data_xs:
-        return sorted(header_xs)
+    if not core_xs:
+        header_xs = [x for x, _ in header_items]
+        data_xs   = _data_clusters(row_map, header_y)
+        if not data_xs:
+            return sorted(header_xs)
+        combined = list(data_xs)
+        for hx in header_xs:
+            if not any(abs(hx - dx) <= 20 for dx in combined):
+                combined.append(hx)
+        return sorted(combined)
 
-    # Inject header positions that have no matching data cluster.
-    # These represent columns that are genuinely empty in this PDF.
-    combined = list(data_xs)
-    for hx in header_xs:
-        if not any(abs(hx - dx) <= 20 for dx in combined):
-            combined.append(hx)
+    # Trailing new fields beyond the known schema: still located via
+    # data-row clustering, since their word width isn't known in advance.
+    data_xs = _data_clusters(row_map, header_y)
+    extra_xs: list[float] = []
+    for x in sorted(x for x in data_xs if x > core_xs[-1] + 10):
+        if not extra_xs or x - extra_xs[-1] > 5.0:
+            extra_xs.append(x)
 
-    return sorted(combined)
+    return core_xs + extra_xs
 
 
-def _resolve_col_names(page, col_xs: list[float], header_y: float) -> list[str]:
+def _resolve_col_names(header_words: list[tuple[float, str]], col_xs: list[float]) -> list[str]:
     """Name each detected column.
 
     The first len(EXPECTED_COLS) positions are assumed to be the known fixed
@@ -212,16 +255,8 @@ def _resolve_col_names(page, col_xs: list[float], header_y: float) -> list[str]:
     so far; only new fields get appended after it when a template changes.
     Any columns beyond that are new fields: their names are read straight
     from the header row's words, grouped into column buckets the same way
-    data rows are (paragraph extraction fuses adjacent header cells, so we
-    re-read the header at word level instead of reusing header_items).
+    data rows are.
     """
-    word_row_map = _group_by_row(_parse_words(page))
-    header_words: list[tuple[float, str]] = []
-    for y, items in word_row_map.items():
-        if abs(y - header_y) <= Y_TOL:
-            header_words = sorted(items, key=lambda x: x[0])
-            break
-
     detected = _assign_boundary(header_words, col_xs)
 
     names: list[str] = []
@@ -285,20 +320,26 @@ def pdf_to_dataframe(file_bytes: bytes) -> pd.DataFrame:
         paragraphs = _parse_html_paragraphs(page)
         row_map    = _group_by_row(paragraphs)
 
-        # Find header row on this page (Y coords reset to 0 on each page)
+        # Find header row on this page (Y coords reset to 0 on each page).
+        # Tight column spacing can make paragraph-mode clustering fuse
+        # adjacent header labels into one <p> (e.g. "CHANNEL BU"), so match
+        # against individual whitespace-split tokens rather than requiring a
+        # paragraph's full text to equal a signal word exactly.
         page_header_items = None
         page_header_y: float | None = None
         for y in sorted(row_map):
             items = sorted(row_map[y], key=lambda x: x[0])
-            if HEADER_SIGNAL & {t for _, t in items}:
+            tokens = {tok for _, text in items for tok in text.split()}
+            if HEADER_SIGNAL & tokens:
                 page_header_items = items
                 page_header_y     = y
                 break
 
         # Learn column positions once from the first page that has a header
         if page_header_items is not None and col_xs is None:
-            col_xs = _build_col_xs(page_header_items, row_map, page_header_y)
-            col_names = _resolve_col_names(page, col_xs, page_header_y)
+            page_header_words = _header_words(page, page_header_y)
+            col_xs = _build_col_xs(page_header_items, page_header_words, row_map, page_header_y)
+            col_names = _resolve_col_names(page_header_words, col_xs)
 
         if col_xs is None:
             continue
