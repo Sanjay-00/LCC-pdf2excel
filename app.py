@@ -177,6 +177,71 @@ def _data_clusters(row_map: dict, header_y: float,
     return clusters
 
 
+def _data_word_clusters(word_row_map: dict, header_y: float,
+                         x_tol: float = 3.0, max_rows: int = 40) -> list[float]:
+    """
+    Collect precise column X positions from data rows' word-level tokens.
+
+    Unlike _data_clusters (paragraph mode, used for genuinely-unknown
+    trailing columns), this scans real data-row words: each numeric or
+    short-code cell is its own token with a real gap either side, so the
+    positions gathered here are pixel-accurate anchors — used to correct
+    header-derived positions in stretches where header labels were fused
+    with no whitespace at all (see _header_char_xs) and interpolation alone
+    can drift by a fraction of a column width over many characters.
+    """
+    all_xs: list[float] = []
+    rows_checked = 0
+
+    for y in sorted(word_row_map):
+        if abs(y - header_y) <= Y_TOL:
+            continue
+        items = sorted(word_row_map[y], key=lambda w: w[0])
+        if len(items) < 30:          # skip title / separator rows
+            continue
+        if any("ZTotal" in t for _, t in items):
+            continue
+        all_xs.extend(left for left, _ in items)
+        rows_checked += 1
+        if rows_checked >= max_rows:
+            break
+
+    if not all_xs:
+        return []
+
+    all_xs.sort()
+    clusters: list[float] = [all_xs[0]]
+    for x in all_xs[1:]:
+        if x - clusters[-1] > x_tol:
+            clusters.append(x)
+    return clusters
+
+
+def _snap_to_data_clusters(xs: list[float], clusters: list[float],
+                            tol: float = 20.0) -> list[float]:
+    """
+    Snap each X in `xs` (in order) to the nearest data-word cluster within
+    `tol`, enforcing strictly increasing output so two columns never
+    collapse onto the same cluster. Falls back to the original (interpolated)
+    X when no cluster is close enough or all nearby clusters are already
+    claimed by an earlier column.
+    """
+    out: list[float] = []
+    last = float("-inf")
+    for x in xs:
+        best, best_d = None, tol
+        for c in clusters:
+            if c <= last:
+                continue
+            d = abs(c - x)
+            if d < best_d:
+                best_d, best = d, c
+        chosen = best if best is not None else max(x, last + 0.01)
+        out.append(chosen)
+        last = chosen
+    return out
+
+
 def _header_words(page, header_y: float) -> list[tuple[float, str]]:
     """Word-level (left, text) tokens for the header row, sorted by X.
 
@@ -193,37 +258,78 @@ def _header_words(page, header_y: float) -> list[tuple[float, str]]:
     return []
 
 
-def _build_col_xs(header_items: list, header_words: list[tuple[float, str]],
-                   row_map: dict, header_y: float) -> list[float]:
+def _header_char_xs(page, header_y: float) -> list[float]:
+    """Per-character estimated X positions across the whole header row.
+
+    Some templates render adjacent header labels with NO whitespace between
+    them at all (e.g. "...Year Of ManufactureArrear Opening...") — even
+    word-level extraction fuses those into one token, so there's no word
+    boundary left to anchor a column's start on. This linearly interpolates
+    each word's pixel width across its characters, giving every character in
+    the header row an estimated X position so a column's start can be
+    located by character offset instead of by word count.
+    """
+    items = []
+    for w in page.get_text("words"):
+        x0, y0, x1, y1, text = w[0], w[1], w[2], w[3], w[4]
+        if abs(y0 - header_y) <= Y_TOL:
+            items.append((x0, x1, text))
+    items.sort(key=lambda t: t[0])
+
+    char_xs: list[float] = []
+    for x0, x1, text in items:
+        n = len(text)
+        if n == 0:
+            continue
+        width = max(x1 - x0, 0.0)
+        for j in range(n):
+            char_xs.append(x0 + width * j / n)
+    return char_xs
+
+
+def _build_col_xs(header_items: list, header_char_xs: list[float],
+                   row_map: dict, word_row_map: dict, header_y: float) -> list[float]:
     """
     Build the list of column X positions.
 
-    Primary strategy: derive each known column's X directly from the header
-    row's word-level tokens, consuming EXPECTED_COLS[i].split() tokens per
-    column in order and taking the first token's X as that column's start.
-    Word-level extraction never fuses across a cell boundary, so this stays
-    correct even on reports where paragraph-mode clustering fuses adjacent
-    cells — both header labels and, on some files, data values too (long
-    values sitting close enough that entire columns never appear as a
-    distinct cluster even after scanning every data row).
+    Primary strategy: derive each known column's X from the header row's
+    per-character X estimates, by walking EXPECTED_COLS in order and
+    advancing by each label's (whitespace-stripped) character count — the
+    X at that running offset is the column's start. This survives templates
+    where adjacent header labels are fused with zero whitespace between them
+    (word-level extraction can't separate those; character offsets can,
+    since the fixed schema's text still lines up character-for-character
+    with the header row's text once spaces are ignored).
+
+    Interpolating a fused word's width uniformly across its characters is
+    only approximate (real font metrics aren't uniform width), so error can
+    accumulate over a long fused stretch and drift a position by a fraction
+    of a column's width. Data-row cells, by contrast, are consistently
+    separate word tokens with real gaps even where the header has none, so
+    each interpolated position is snapped onto the nearest real data-word
+    cluster when one exists nearby — correcting the drift while keeping the
+    header-derived column order and count intact (data clustering alone
+    can't guarantee either, since empty columns disappear and multi-word
+    text columns add extra spurious clusters).
 
     Falls back to the old data-row-clustering approach if the header row
-    doesn't tokenize into at least as many words as the known schema needs
-    (e.g. a differently-worded template).
+    doesn't contain enough characters for the known schema (e.g. a
+    differently-worded template).
 
     Not capped to a fixed column count: trailing new fields beyond the
     known schema are still detected from data-row clustering, since we
-    don't know their word width in advance.
+    don't know their width in advance.
     """
     core_xs: list[float] = []
-    idx = 0
+    offset = 0
+    total_chars = len(header_char_xs)
     for label in EXPECTED_COLS:
-        n = len(label.split()) or 1
-        if idx + n > len(header_words):
+        stripped_len = len(label.replace(" ", "")) or 1
+        if offset >= total_chars:
             core_xs = []
             break
-        core_xs.append(header_words[idx][0])
-        idx += n
+        core_xs.append(header_char_xs[offset])
+        offset += stripped_len
 
     if not core_xs:
         header_xs = [x for x, _ in header_items]
@@ -235,6 +341,10 @@ def _build_col_xs(header_items: list, header_words: list[tuple[float, str]],
             if not any(abs(hx - dx) <= 20 for dx in combined):
                 combined.append(hx)
         return sorted(combined)
+
+    word_clusters = _data_word_clusters(word_row_map, header_y)
+    if word_clusters:
+        core_xs = _snap_to_data_clusters(core_xs, word_clusters)
 
     # Trailing new fields beyond the known schema: still located via
     # data-row clustering, since their word width isn't known in advance.
@@ -319,6 +429,7 @@ def pdf_to_dataframe(file_bytes: bytes) -> pd.DataFrame:
     for page in doc:
         paragraphs = _parse_html_paragraphs(page)
         row_map    = _group_by_row(paragraphs)
+        word_row_map = _group_by_row(_parse_words(page))
 
         # Find header row on this page (Y coords reset to 0 on each page).
         # Tight column spacing can make paragraph-mode clustering fuse
@@ -338,7 +449,8 @@ def pdf_to_dataframe(file_bytes: bytes) -> pd.DataFrame:
         # Learn column positions once from the first page that has a header
         if page_header_items is not None and col_xs is None:
             page_header_words = _header_words(page, page_header_y)
-            col_xs = _build_col_xs(page_header_items, page_header_words, row_map, page_header_y)
+            page_header_char_xs = _header_char_xs(page, page_header_y)
+            col_xs = _build_col_xs(page_header_items, page_header_char_xs, row_map, word_row_map, page_header_y)
             col_names = _resolve_col_names(page_header_words, col_xs)
 
         if col_xs is None:
@@ -348,7 +460,6 @@ def pdf_to_dataframe(file_bytes: bytes) -> pd.DataFrame:
         # HTML-paragraph view can fuse two adjacent cells into one <p> when
         # their text sits close together (e.g. a long name running into the
         # next column's value), silently dropping the boundary between them.
-        word_row_map = _group_by_row(_parse_words(page))
         for y in sorted(word_row_map):
             if page_header_y is not None and abs(y - page_header_y) <= Y_TOL:
                 continue
