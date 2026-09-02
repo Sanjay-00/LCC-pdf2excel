@@ -220,26 +220,67 @@ def _data_word_clusters(word_row_map: dict, header_y: float,
 def _snap_to_data_clusters(xs: list[float], clusters: list[float],
                             tol: float = 20.0) -> list[float]:
     """
-    Snap each X in `xs` (in order) to the nearest data-word cluster within
-    `tol`, enforcing strictly increasing output so two columns never
-    collapse onto the same cluster. Falls back to the original (interpolated)
-    X when no cluster is close enough or all nearby clusters are already
-    claimed by an earlier column.
+    Snap each X in `xs` to a data-word cluster, choosing the globally
+    cheapest strictly-increasing assignment (each cluster used at most
+    once, cluster order preserved) via dynamic programming — like a
+    sequence alignment. Falls back to the original (interpolated) X for
+    any column left unmatched (no cluster within `tol`, or clusters used
+    up by cheaper matches elsewhere).
+
+    A naive nearest-cluster-first greedy pass can lock in a mediocre local
+    match that leaves the next column's true cluster just out of tolerance
+    (observed with adjacent short header labels like "POS"/"scheme", whose
+    interpolated positions land close enough to compete for one cluster).
+    The DP considers the whole row at once, so it won't sacrifice a later
+    column's good match to an earlier column's merely-okay one.
+
+    Leaving a column unmatched (falling back to its raw interpolated X)
+    costs a flat `tol` — worse than any valid match (whose cost is at most
+    `tol`) but free relative to clusters that don't correspond to any
+    column at all, which can always be skipped for nothing. Without that
+    penalty the DP degenerates into skipping every cluster, since a skip
+    is unconditionally cheaper than any positive-cost match.
     """
-    out: list[float] = []
-    last = float("-inf")
-    for x in xs:
-        best, best_d = None, tol
-        for c in clusters:
-            if c <= last:
-                continue
-            d = abs(c - x)
-            if d < best_d:
-                best_d, best = d, c
-        chosen = best if best is not None else max(x, last + 0.01)
-        out.append(chosen)
-        last = chosen
-    return out
+    n, m = len(xs), len(clusters)
+    if n == 0 or m == 0:
+        return list(xs)
+
+    INF = float("inf")
+    UNMATCHED = tol
+
+    def cost(i: int, j: int) -> float:
+        d = abs(xs[i] - clusters[j])
+        return d if d <= tol else INF
+
+    # dp[i][j] = min cost assigning xs[:i], having considered clusters[:j]
+    # (each used at most once, in order). Three transitions: skip cluster
+    # j-1 (free), leave column i-1 unmatched (cost UNMATCHED), or match
+    # column i-1 to cluster j-1 (cost = distance, if within tol).
+    dp = [[0.0] * (m + 1) for _ in range(n + 1)]
+    for i in range(1, n + 1):
+        dp[i][0] = dp[i - 1][0] + UNMATCHED
+    for i in range(1, n + 1):
+        for j in range(1, m + 1):
+            skip_cluster = dp[i][j - 1]
+            leave_unmatched = dp[i - 1][j] + UNMATCHED
+            c = cost(i - 1, j - 1)
+            match = dp[i - 1][j - 1] + c if c < INF else INF
+            dp[i][j] = min(skip_cluster, leave_unmatched, match)
+
+    assign: list[float | None] = [None] * n
+    i, j = n, m
+    while i > 0 or j > 0:
+        c = cost(i - 1, j - 1) if i > 0 and j > 0 else INF
+        if i > 0 and j > 0 and c < INF and dp[i][j] == dp[i - 1][j - 1] + c:
+            assign[i - 1] = clusters[j - 1]
+            i -= 1
+            j -= 1
+        elif i > 0 and dp[i][j] == dp[i - 1][j] + UNMATCHED:
+            i -= 1
+        else:
+            j -= 1
+
+    return [assign[i] if assign[i] is not None else xs[i] for i in range(n)]
 
 
 def _header_words(page, header_y: float) -> list[tuple[float, str]]:
@@ -258,8 +299,10 @@ def _header_words(page, header_y: float) -> list[tuple[float, str]]:
     return []
 
 
-def _header_char_xs(page, header_y: float) -> list[float]:
-    """Per-character estimated X positions across the whole header row.
+def _header_char_xs(page, header_y: float) -> tuple[list[float], list[tuple[float, float, str]]]:
+    """Per-character estimated X positions across the whole header row, plus
+    the real (whitespace-separated) header word tokens themselves (X and
+    text) the character positions were interpolated from.
 
     Some templates render adjacent header labels with NO whitespace between
     them at all (e.g. "...Year Of ManufactureArrear Opening...") — even
@@ -268,6 +311,14 @@ def _header_char_xs(page, header_y: float) -> list[float]:
     each word's pixel width across its characters, giving every character in
     the header row an estimated X position so a column's start can be
     located by character offset instead of by word count.
+
+    That per-character interpolation is only approximate, and small errors
+    compound across many labels (real fonts aren't uniform-width, and a
+    fused token's true character count can differ slightly from what the
+    schema's assumed word split implies). The returned word tokens let a
+    caller override individual columns with an exact pixel position when a
+    schema label happens to match one of these real (unfused) words
+    verbatim, without touching any of the interpolated positions in between.
     """
     items = []
     for w in page.get_text("words"):
@@ -284,10 +335,11 @@ def _header_char_xs(page, header_y: float) -> list[float]:
         width = max(x1 - x0, 0.0)
         for j in range(n):
             char_xs.append(x0 + width * j / n)
-    return char_xs
+    return char_xs, items
 
 
 def _build_col_xs(header_items: list, header_char_xs: list[float],
+                   header_word_tokens: list[tuple[float, float, str]],
                    row_map: dict, word_row_map: dict, header_y: float) -> list[float]:
     """
     Build the list of column X positions.
@@ -312,23 +364,45 @@ def _build_col_xs(header_items: list, header_char_xs: list[float],
     can't guarantee either, since empty columns disappear and multi-word
     text columns add extra spurious clusters).
 
-    Falls back to the old data-row-clustering approach if the header row
-    doesn't contain enough characters for the known schema (e.g. a
-    differently-worded template).
+    Falls back to the old data-row-clustering approach only if the header
+    row doesn't contain enough characters for even the first known column
+    (e.g. a completely differently-worded template). If it runs out partway
+    through — e.g. a template variant that drops some trailing schema
+    fields entirely — the positions already resolved are kept rather than
+    discarded, since throwing away correctly-computed early columns just to
+    handle a handful of missing trailing ones cascades misalignment through
+    the whole row.
 
     Not capped to a fixed column count: trailing new fields beyond the
     known schema are still detected from data-row clustering, since we
     don't know their width in advance.
+
+    Exact-word override: a schema label that verbatim matches one of the
+    header row's real (unfused) word tokens gets that word's exact pixel X
+    instead of the interpolated one, since it's ground truth rather than an
+    estimate. This only fires for an unambiguous one-to-one text match, so
+    it corrects short/narrow labels prone to interpolation drift (e.g. a
+    fused stretch earlier in the row throwing off the running character
+    offset by a few characters) without disturbing any other column.
     """
+    exact_word_x: dict[str, float] = {}
+    for x0, _x1, text in header_word_tokens:
+        key = text.strip().lower()
+        if key and key not in exact_word_x:
+            exact_word_x[key] = x0
+
     core_xs: list[float] = []
     offset = 0
     total_chars = len(header_char_xs)
     for label in EXPECTED_COLS:
         stripped_len = len(label.replace(" ", "")) or 1
         if offset >= total_chars:
-            core_xs = []
             break
-        core_xs.append(header_char_xs[offset])
+        label_key = label.replace(" ", "").lower()
+        if label_key in exact_word_x:
+            core_xs.append(exact_word_x[label_key])
+        else:
+            core_xs.append(header_char_xs[offset])
         offset += stripped_len
 
     if not core_xs:
@@ -449,8 +523,9 @@ def pdf_to_dataframe(file_bytes: bytes) -> pd.DataFrame:
         # Learn column positions once from the first page that has a header
         if page_header_items is not None and col_xs is None:
             page_header_words = _header_words(page, page_header_y)
-            page_header_char_xs = _header_char_xs(page, page_header_y)
-            col_xs = _build_col_xs(page_header_items, page_header_char_xs, row_map, word_row_map, page_header_y)
+            page_header_char_xs, page_header_word_starts = _header_char_xs(page, page_header_y)
+            col_xs = _build_col_xs(page_header_items, page_header_char_xs, page_header_word_starts,
+                                    row_map, word_row_map, page_header_y)
             col_names = _resolve_col_names(page_header_words, col_xs)
 
         if col_xs is None:
