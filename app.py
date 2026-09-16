@@ -178,7 +178,8 @@ def _data_clusters(row_map: dict, header_y: float,
 
 
 def _data_word_clusters(word_row_map: dict, header_y: float,
-                         x_tol: float = 3.0, max_rows: int = 40) -> list[float]:
+                         x_tol: float = 3.0, max_rows: int = 40,
+                         min_freq_ratio: float = 0.0) -> list[float]:
     """
     Collect precise column X positions from data rows' word-level tokens.
 
@@ -189,6 +190,17 @@ def _data_word_clusters(word_row_map: dict, header_y: float,
     header-derived positions in stretches where header labels were fused
     with no whitespace at all (see _header_char_xs) and interpolation alone
     can drift by a fraction of a column width over many characters.
+
+    A genuine column's left edge sits at essentially the same X on almost
+    every sampled row (the template's fixed left margin for that column).
+    The *second* word of a multi-word value in a wide column (e.g. a
+    customer name) does not: its X depends on how long that row's first
+    word happened to be, so it scatters across many nearby-but-distinct
+    clusters, each backed by only a handful of rows. `min_freq_ratio`
+    (0-1, as a fraction of sampled rows) drops any cluster that doesn't
+    clear that bar — filtering out exactly this kind of scattered noise
+    while keeping true column edges, which by definition appear on nearly
+    every row.
     """
     all_xs: list[float] = []
     rows_checked = 0
@@ -210,15 +222,23 @@ def _data_word_clusters(word_row_map: dict, header_y: float,
         return []
 
     all_xs.sort()
-    clusters: list[float] = [all_xs[0]]
+    groups: list[list[float]] = [[all_xs[0]]]
     for x in all_xs[1:]:
-        if x - clusters[-1] > x_tol:
-            clusters.append(x)
-    return clusters
+        # Compared against the group's own first point (not the running
+        # last point) to reproduce the original single-anchor chaining
+        # exactly — changing this would shift cluster boundaries for the
+        # non-multiline path too, which the other 20 verified files depend on.
+        if x - groups[-1][0] > x_tol:
+            groups.append([x])
+        else:
+            groups[-1].append(x)
+
+    min_count = min_freq_ratio * rows_checked
+    return [g[0] for g in groups if len(g) >= min_count]
 
 
 def _snap_to_data_clusters(xs: list[float], clusters: list[float],
-                            tol: float = 20.0) -> list[float]:
+                            tol: float = 20.0, left_bias: float = 1.0) -> list[float]:
     """
     Snap each X in `xs` to a data-word cluster, choosing the globally
     cheapest strictly-increasing assignment (each cluster used at most
@@ -240,6 +260,20 @@ def _snap_to_data_clusters(xs: list[float], clusters: list[float],
     column at all, which can always be skipped for nothing. Without that
     penalty the DP degenerates into skipping every cluster, since a skip
     is unconditionally cheaper than any positive-cost match.
+
+    `left_bias` < 1 discounts the cost of a cluster to the left of the raw
+    X relative to one to the right, for genuine near-ties: a wide column
+    with a *consistently* multi-word value (e.g. always "MUMBAI CV") has
+    both words appear on essentially every row, so both are equally
+    legitimate, high-confidence clusters — only their order tells you
+    which is the real column start. This bias is only safe to use against
+    a cluster list that's already been filtered to high-frequency
+    clusters (see `_data_word_clusters`'s `min_freq_ratio`): applied
+    against the full, unfiltered list it can just as easily out-bid a
+    correct nearby match with a scattered, coincidentally-close but wrong
+    one (a variable-length value's second word lands at a different X on
+    almost every row, so *some* row's version of it can sit deceptively
+    close to the true neighboring column).
     """
     n, m = len(xs), len(clusters)
     if n == 0 or m == 0:
@@ -249,7 +283,8 @@ def _snap_to_data_clusters(xs: list[float], clusters: list[float],
     UNMATCHED = tol
 
     def cost(i: int, j: int) -> float:
-        d = abs(xs[i] - clusters[j])
+        d = clusters[j] - xs[i]
+        d = -d * left_bias if d < 0 else d
         return d if d <= tol else INF
 
     # dp[i][j] = min cost assigning xs[:i], having considered clusters[:j]
@@ -326,7 +361,15 @@ def _header_char_xs(page, header_y: float) -> tuple[list[float], list[tuple[floa
         if abs(y0 - header_y) <= Y_TOL:
             items.append((x0, x1, text))
     items.sort(key=lambda t: t[0])
+    return _char_xs_from_items(items), items
 
+
+def _char_xs_from_items(items: list[tuple[float, float, str]]) -> list[float]:
+    """Interpolate per-character X positions across a sequence of (x0, x1,
+    text) items, already in left-to-right reading order. Shared by the
+    single-line header path and the multi-line one (_multiline_header_items),
+    which builds its items differently but needs the same interpolation.
+    """
     char_xs: list[float] = []
     for x0, x1, text in items:
         n = len(text)
@@ -335,47 +378,242 @@ def _header_char_xs(page, header_y: float) -> tuple[list[float], list[tuple[floa
         width = max(x1 - x0, 0.0)
         for j in range(n):
             char_xs.append(x0 + width * j / n)
-    return char_xs, items
+    return char_xs
 
 
-def _build_col_xs(header_items: list, header_char_xs: list[float],
-                   header_word_tokens: list[tuple[float, float, str]],
-                   row_map: dict, word_row_map: dict, header_y: float) -> list[float]:
+def _header_line_ys(page, anchor_y: float, max_gap: float = 4.0,
+                     search_band: float = 20.0) -> list[float]:
+    """Find every header-row Y that belongs to the same (possibly wrapped)
+    header block as `anchor_y`, by walking outward through the page's
+    distinct word Y-coordinates while the gap between consecutive lines
+    stays small.
+
+    Deliberately reads raw word Y-coordinates from `page` rather than a
+    pre-grouped word_row_map: _group_by_row's tolerance-chaining (any new
+    Y within Y_TOL of an *existing* bucket key joins it) can transitively
+    fuse three or more genuinely separate header lines into one bucket
+    when each sits within Y_TOL of its neighbor, even though the first and
+    last are farther apart than Y_TOL — exactly the case this function
+    needs to tell apart.
+
+    Some templates wrap long column labels across 2-3 stacked lines (e.g.
+    "Year Of" on one line, "Manufacture" on the line below, both belonging
+    to the single column "Year Of Manufacture"). Those lines sit close
+    together (a couple of points apart, observed ~2-3), distinctly closer
+    than the gap to the next real data row (observed ~5.5-6.6) — `max_gap`
+    sits between the two so it picks up every wrapped header line without
+    reaching into actual data.
     """
-    Build the list of column X positions.
+    ys = sorted({round(w[1], 1) for w in page.get_text("words")
+                 if abs(w[1] - anchor_y) <= search_band})
+    if not ys:
+        return [anchor_y]
+    idx = min(range(len(ys)), key=lambda i: abs(ys[i] - anchor_y))
+    block = [ys[idx]]
+    i = idx - 1
+    while i >= 0 and block[0] - ys[i] <= max_gap:
+        block.insert(0, ys[i])
+        i -= 1
+    i = idx + 1
+    while i < len(ys) and ys[i] - block[-1] <= max_gap:
+        block.append(ys[i])
+        i += 1
+    return block
 
-    Primary strategy: derive each known column's X from the header row's
-    per-character X estimates, by walking EXPECTED_COLS in order and
-    advancing by each label's (whitespace-stripped) character count — the
-    X at that running offset is the column's start. This survives templates
-    where adjacent header labels are fused with zero whitespace between them
-    (word-level extraction can't separate those; character offsets can,
-    since the fixed schema's text still lines up character-for-character
-    with the header row's text once spaces are ignored).
 
-    Interpolating a fused word's width uniformly across its characters is
-    only approximate (real font metrics aren't uniform width), so error can
-    accumulate over a long fused stretch and drift a position by a fraction
-    of a column's width. Data-row cells, by contrast, are consistently
-    separate word tokens with real gaps even where the header has none, so
-    each interpolated position is snapped onto the nearest real data-word
-    cluster when one exists nearby — correcting the drift while keeping the
-    header-derived column order and count intact (data clustering alone
-    can't guarantee either, since empty columns disappear and multi-word
-    text columns add extra spurious clusters).
+def _norm_token(s: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", s.lower())
 
-    Falls back to the old data-row-clustering approach only if the header
-    row doesn't contain enough characters for even the first known column
-    (e.g. a completely differently-worded template). If it runs out partway
-    through — e.g. a template variant that drops some trailing schema
-    fields entirely — the positions already resolved are kept rather than
-    discarded, since throwing away correctly-computed early columns just to
-    handle a handful of missing trailing ones cascades misalignment through
-    the whole row.
 
-    Not capped to a fixed column count: trailing new fields beyond the
-    known schema are still detected from data-row clustering, since we
-    don't know their width in advance.
+def _multiline_match_positions(page, line_ys: list[float]) -> list[float | None]:
+    """Match EXPECTED_COLS against a header block spanning multiple stacked
+    lines by consuming real header words in text order — one X position per
+    schema label (or None where it can't be resolved), aligned with
+    EXPECTED_COLS by index.
+
+    Position-based heuristics (sorting by X, or clustering words by X
+    proximity) don't work reliably on this kind of layout: a same-column
+    stacked line-break can sit closer in X (~2-6px observed) than two
+    genuinely different, tightly-spaced adjacent columns (~7px+ observed)
+    — the ranges overlap, so no fixed tolerance separates them everywhere.
+
+    What *is* reliable: each individual header line is already in correct
+    left-to-right reading order (real word extraction never reorders
+    within one line), and we know exactly which words we're looking for
+    (EXPECTED_COLS). So this walks the schema in order and, for each word
+    of each label, matches it (case/punctuation-insensitive) against
+    whichever line's next unconsumed word(s) spell it out.
+
+    Two complications beyond a plain one-word-per-token match:
+    - A single schema word can itself be split across two real header
+      tokens (observed: "DelinquencyDays" rendered as "DelinquencyDay" on
+      one line and a stray "s" on another) — handled by greedily
+      concatenating up to a few of the next available words, across
+      whichever lines have them, until the accumulated text either matches
+      or stops being a valid prefix.
+    - A schema word can have no matching text at all in this template
+      variant (observed: "VehEMI Accrued" rendered as just "EMI Accrued",
+      missing the "Veh" prefix) — a genuine content difference, not an
+      ordering ambiguity. Left unmatched, this would permanently jam the
+      affected line's pointer on the orphaned word forever. Recovered by
+      trying up to a couple of "skip this next word as unmatchable, try
+      again" steps before giving up on a token entirely, so one bad label
+      doesn't cascade into every later one failing too.
+    """
+    lines: dict[float, list[tuple[float, str]]] = {}
+    for y in line_ys:
+        words = sorted(
+            ((w[0], w[4]) for w in page.get_text("words") if round(w[1], 1) == y),
+            key=lambda t: t[0],
+        )
+        lines[y] = words
+
+    def smallest_next(ptr: dict[float, int]):
+        """The single leftmost unconsumed word across all lines, ignoring
+        text — used only to discard an orphan during skip-recovery."""
+        best = None
+        for y in line_ys:
+            i = ptr[y]
+            words = lines[y]
+            if i >= len(words):
+                continue
+            x0, text = words[i]
+            if best is None or x0 < best[0]:
+                best = (x0, y, text)
+        return best
+
+    def best_start(ptr: dict[float, int], tok_n: str, last_x: float):
+        """Among lines whose current word's text is a valid prefix of
+        tok_n, the one at/after last_x if any, else the leftmost. Position
+        is only a tie-break AMONG text-valid candidates — applying it
+        before filtering by text let a wrong-text word that happened to
+        sit past last_x outrank the actual match sitting just behind it."""
+        candidates = []
+        for y in line_ys:
+            i = ptr[y]
+            words = lines[y]
+            if i >= len(words):
+                continue
+            x0, text = words[i]
+            nt = _norm_token(text)
+            # A punctuation-only schema token (e.g. "/") normalizes to "" —
+            # only match it against an equally punctuation-only word, never
+            # let an empty nt trivially "prefix-match" every real token.
+            if (nt and tok_n.startswith(nt)) or (not nt and not tok_n):
+                candidates.append((x0, y, text))
+        if not candidates:
+            return None
+        candidates.sort(key=lambda c: (c[0] < last_x, c[0]))
+        return candidates[0]
+
+    def consume_token(tok_n: str, ptr: dict[float, int], last_x: float,
+                       max_skip: int = 2, max_words: int = 3):
+        for skip in range(max_skip + 1):
+            trial = dict(ptr)
+            ok = True
+            for _ in range(skip):
+                cand = smallest_next(trial)
+                if cand is None:
+                    ok = False
+                    break
+                _, y, _ = cand
+                trial[y] += 1
+            if not ok:
+                break
+
+            first = best_start(trial, tok_n, last_x)
+            if first is None:
+                continue
+            x0, y, text = first
+            acc_x = x0
+            acc = _norm_token(text)
+            trial[y] += 1
+            if acc == tok_n:
+                ptr.clear()
+                ptr.update(trial)
+                return acc_x
+
+            for _ in range(max_words - 1):
+                if not tok_n.startswith(acc):
+                    break
+                cand = smallest_next(trial)
+                if cand is None:
+                    break
+                _, y2, text2 = cand
+                acc += _norm_token(text2)
+                trial[y2] += 1
+                if acc == tok_n:
+                    ptr.clear()
+                    ptr.update(trial)
+                    return acc_x
+        return None
+
+    ptr = {y: 0 for y in line_ys}
+    last_x = float("-inf")
+    positions: list[float | None] = []
+
+    for label in EXPECTED_COLS:
+        label_x0 = None
+        resolved = True
+        for tok in label.split():
+            chosen_x = consume_token(_norm_token(tok), ptr, last_x)
+            if chosen_x is None:
+                resolved = False
+                break
+            if label_x0 is None:
+                label_x0 = chosen_x
+            last_x = chosen_x
+        positions.append(label_x0 if resolved else None)
+
+    return positions
+
+
+def _fill_multiline_positions(positions: list[float | None]) -> list[float]:
+    """Turn a possibly-gappy per-label position list (from
+    _multiline_match_positions) into a dense, monotonic core_xs.
+
+    A trailing run of unresolved labels (nothing after them was resolved
+    either) is dropped outright — same "keep what's known, don't force a
+    guess" rule as the single-line path uses for templates missing
+    trailing schema fields. A gap in the *middle* (resolved labels on both
+    sides) gets linearly interpolated between its two known neighbors by
+    index, since some position is needed to keep every later label's index
+    aligned with EXPECTED_COLS, and interpolation stays safely between two
+    real anchors rather than guessing blindly.
+    """
+    last_resolved = max((i for i, p in enumerate(positions) if p is not None), default=-1)
+    trimmed = positions[:last_resolved + 1]
+
+    filled: list[float] = []
+    for i, p in enumerate(trimmed):
+        if p is not None:
+            filled.append(p)
+            continue
+        prev_i, prev_v = next((j, trimmed[j]) for j in range(i - 1, -1, -1) if trimmed[j] is not None)
+        next_i, next_v = next((j, trimmed[j]) for j in range(i + 1, len(trimmed)) if trimmed[j] is not None)
+        frac = (i - prev_i) / (next_i - prev_i)
+        filled.append(prev_v + (next_v - prev_v) * frac)
+    return filled
+
+
+def _core_xs_from_char_offsets(header_char_xs: list[float],
+                                header_word_tokens: list[tuple[float, float, str]]) -> list[float]:
+    """Single-line header strategy: derive each known column's X from the
+    header row's per-character X estimates, by walking EXPECTED_COLS in
+    order and advancing by each label's (whitespace-stripped) character
+    count — the X at that running offset is the column's start. Survives
+    templates where adjacent header labels are fused with zero whitespace
+    between them (word-level extraction can't separate those; character
+    offsets can, since the fixed schema's text still lines up
+    character-for-character with the header row's text once spaces are
+    ignored).
+
+    Stops (keeping what's already resolved) if the header runs out of
+    characters before the schema does — e.g. a template variant that drops
+    some trailing schema fields entirely — rather than discarding
+    everything, since throwing away correctly-computed early columns to
+    handle a handful of missing trailing ones would cascade misalignment
+    through the whole row.
 
     Exact-word override: a schema label that verbatim matches one of the
     header row's real (unfused) word tokens gets that word's exact pixel X
@@ -404,6 +642,33 @@ def _build_col_xs(header_items: list, header_char_xs: list[float],
         else:
             core_xs.append(header_char_xs[offset])
         offset += stripped_len
+    return core_xs
+
+
+def _build_col_xs(header_items: list, header_char_xs: list[float],
+                   header_word_tokens: list[tuple[float, float, str]],
+                   row_map: dict, word_row_map: dict, header_y: float,
+                   precomputed_core_xs: list[float] | None = None) -> list[float]:
+    """
+    Build the list of column X positions.
+
+    `core_xs` (one X per known schema column, in order) comes from
+    `precomputed_core_xs` when the caller already resolved it — e.g. via
+    text-matching for a multi-line wrapped header — otherwise from
+    `_core_xs_from_char_offsets`'s single-line character-offset strategy.
+
+    Either way, each position is then snapped onto the nearest real
+    data-word cluster when one exists nearby, correcting drift while
+    keeping the column order and count intact (data clustering alone can't
+    guarantee either, since empty columns disappear and multi-word text
+    columns add extra spurious clusters). Trailing new fields beyond the
+    known schema are still detected from data-row clustering, since we
+    don't know their width in advance.
+    """
+    if precomputed_core_xs is not None:
+        core_xs = precomputed_core_xs
+    else:
+        core_xs = _core_xs_from_char_offsets(header_char_xs, header_word_tokens)
 
     if not core_xs:
         header_xs = [x for x, _ in header_items]
@@ -416,9 +681,22 @@ def _build_col_xs(header_items: list, header_char_xs: list[float],
                 combined.append(hx)
         return sorted(combined)
 
-    word_clusters = _data_word_clusters(word_row_map, header_y)
-    if word_clusters:
-        core_xs = _snap_to_data_clusters(core_xs, word_clusters)
+    if precomputed_core_xs is not None:
+        # Filter to clusters that show up on nearly every sampled row —
+        # a real column's left edge does, but a variable-length value's
+        # second word (e.g. a customer name) lands at a different X on
+        # almost every row and so scatters into many low-frequency
+        # clusters. With that noise gone, a modest leftward bias resolves
+        # the remaining genuine near-ties (e.g. a column whose value is
+        # *always* two words, so both words are equally high-frequency —
+        # only their order says which one is the true start).
+        word_clusters = _data_word_clusters(word_row_map, header_y, min_freq_ratio=0.9)
+        if word_clusters:
+            core_xs = _snap_to_data_clusters(core_xs, word_clusters, left_bias=0.01)
+    else:
+        word_clusters = _data_word_clusters(word_row_map, header_y)
+        if word_clusters:
+            core_xs = _snap_to_data_clusters(core_xs, word_clusters)
 
     # Trailing new fields beyond the known schema: still located via
     # data-row clustering, since their word width isn't known in advance.
@@ -523,9 +801,24 @@ def pdf_to_dataframe(file_bytes: bytes) -> pd.DataFrame:
         # Learn column positions once from the first page that has a header
         if page_header_items is not None and col_xs is None:
             page_header_words = _header_words(page, page_header_y)
+
+            # Some templates wrap long labels across several stacked header
+            # lines rather than one (or one fused) line — detect that and
+            # resolve column positions by text-matching EXPECTED_COLS
+            # against the real header words directly, since a wrapped
+            # line's word can start to the left of the line above it for
+            # the same column, which breaks any position-only approach.
+            line_ys = _header_line_ys(page, page_header_y)
+            precomputed_core_xs = None
+            if len(line_ys) > 1:
+                positions = _multiline_match_positions(page, line_ys)
+                if any(p is not None for p in positions):
+                    precomputed_core_xs = _fill_multiline_positions(positions)
             page_header_char_xs, page_header_word_starts = _header_char_xs(page, page_header_y)
+
             col_xs = _build_col_xs(page_header_items, page_header_char_xs, page_header_word_starts,
-                                    row_map, word_row_map, page_header_y)
+                                    row_map, word_row_map, page_header_y,
+                                    precomputed_core_xs=precomputed_core_xs)
             col_names = _resolve_col_names(page_header_words, col_xs)
 
         if col_xs is None:
