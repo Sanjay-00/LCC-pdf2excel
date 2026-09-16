@@ -178,7 +178,8 @@ def _data_clusters(row_map: dict, header_y: float,
 
 
 def _data_word_clusters(word_row_map: dict, header_y: float,
-                         x_tol: float = 3.0, max_rows: int = 40) -> list[float]:
+                         x_tol: float = 3.0, max_rows: int = 40,
+                         min_freq_ratio: float = 0.0) -> list[float]:
     """
     Collect precise column X positions from data rows' word-level tokens.
 
@@ -189,6 +190,17 @@ def _data_word_clusters(word_row_map: dict, header_y: float,
     header-derived positions in stretches where header labels were fused
     with no whitespace at all (see _header_char_xs) and interpolation alone
     can drift by a fraction of a column width over many characters.
+
+    A genuine column's left edge sits at essentially the same X on almost
+    every sampled row (the template's fixed left margin for that column).
+    The *second* word of a multi-word value in a wide column (e.g. a
+    customer name) does not: its X depends on how long that row's first
+    word happened to be, so it scatters across many nearby-but-distinct
+    clusters, each backed by only a handful of rows. `min_freq_ratio`
+    (0-1, as a fraction of sampled rows) drops any cluster that doesn't
+    clear that bar — filtering out exactly this kind of scattered noise
+    while keeping true column edges, which by definition appear on nearly
+    every row.
     """
     all_xs: list[float] = []
     rows_checked = 0
@@ -210,11 +222,19 @@ def _data_word_clusters(word_row_map: dict, header_y: float,
         return []
 
     all_xs.sort()
-    clusters: list[float] = [all_xs[0]]
+    groups: list[list[float]] = [[all_xs[0]]]
     for x in all_xs[1:]:
-        if x - clusters[-1] > x_tol:
-            clusters.append(x)
-    return clusters
+        # Compared against the group's own first point (not the running
+        # last point) to reproduce the original single-anchor chaining
+        # exactly — changing this would shift cluster boundaries for the
+        # non-multiline path too, which the other 20 verified files depend on.
+        if x - groups[-1][0] > x_tol:
+            groups.append([x])
+        else:
+            groups[-1].append(x)
+
+    min_count = min_freq_ratio * rows_checked
+    return [g[0] for g in groups if len(g) >= min_count]
 
 
 def _snap_to_data_clusters(xs: list[float], clusters: list[float],
@@ -241,14 +261,19 @@ def _snap_to_data_clusters(xs: list[float], clusters: list[float],
     penalty the DP degenerates into skipping every cluster, since a skip
     is unconditionally cheaper than any positive-cost match.
 
-    `left_bias` < 1 discounts the cost of a cluster to the *left* of the
-    raw X relative to one to the right, when both are otherwise similar
-    distances away. A multi-word cell (e.g. a two-word "BU" value) can
-    make the real column start noticeably left of the header word's own
-    (single-word, narrower) position — nearer-by-raw-distance alone then
-    picks a cluster that actually belongs to the *next* real word inside
-    that same cell, pulling the true first word into the previous column
-    instead.
+    `left_bias` < 1 discounts the cost of a cluster to the left of the raw
+    X relative to one to the right, for genuine near-ties: a wide column
+    with a *consistently* multi-word value (e.g. always "MUMBAI CV") has
+    both words appear on essentially every row, so both are equally
+    legitimate, high-confidence clusters — only their order tells you
+    which is the real column start. This bias is only safe to use against
+    a cluster list that's already been filtered to high-frequency
+    clusters (see `_data_word_clusters`'s `min_freq_ratio`): applied
+    against the full, unfiltered list it can just as easily out-bid a
+    correct nearby match with a scattered, coincidentally-close but wrong
+    one (a variable-length value's second word lands at a different X on
+    almost every row, so *some* row's version of it can sit deceptively
+    close to the true neighboring column).
     """
     n, m = len(xs), len(clusters)
     if n == 0 or m == 0:
@@ -656,10 +681,22 @@ def _build_col_xs(header_items: list, header_char_xs: list[float],
                 combined.append(hx)
         return sorted(combined)
 
-    word_clusters = _data_word_clusters(word_row_map, header_y)
-    if word_clusters:
-        bias = 0.6 if precomputed_core_xs is not None else 1.0
-        core_xs = _snap_to_data_clusters(core_xs, word_clusters, left_bias=bias)
+    if precomputed_core_xs is not None:
+        # Filter to clusters that show up on nearly every sampled row —
+        # a real column's left edge does, but a variable-length value's
+        # second word (e.g. a customer name) lands at a different X on
+        # almost every row and so scatters into many low-frequency
+        # clusters. With that noise gone, a modest leftward bias resolves
+        # the remaining genuine near-ties (e.g. a column whose value is
+        # *always* two words, so both words are equally high-frequency —
+        # only their order says which one is the true start).
+        word_clusters = _data_word_clusters(word_row_map, header_y, min_freq_ratio=0.9)
+        if word_clusters:
+            core_xs = _snap_to_data_clusters(core_xs, word_clusters, left_bias=0.01)
+    else:
+        word_clusters = _data_word_clusters(word_row_map, header_y)
+        if word_clusters:
+            core_xs = _snap_to_data_clusters(core_xs, word_clusters)
 
     # Trailing new fields beyond the known schema: still located via
     # data-row clustering, since their word width isn't known in advance.
