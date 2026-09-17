@@ -460,10 +460,10 @@ def _multiline_match_positions(page, line_ys: list[float]) -> list[float | None]
       again" steps before giving up on a token entirely, so one bad label
       doesn't cascade into every later one failing too.
     """
-    lines: dict[float, list[tuple[float, str]]] = {}
+    lines: dict[float, list[tuple[float, float, str]]] = {}
     for y in line_ys:
         words = sorted(
-            ((w[0], w[4]) for w in page.get_text("words") if round(w[1], 1) == y),
+            ((w[0], w[2], w[4]) for w in page.get_text("words") if round(w[1], 1) == y),
             key=lambda t: t[0],
         )
         lines[y] = words
@@ -477,7 +477,7 @@ def _multiline_match_positions(page, line_ys: list[float]) -> list[float | None]
             words = lines[y]
             if i >= len(words):
                 continue
-            x0, text = words[i]
+            x0, _x1, text = words[i]
             if best is None or x0 < best[0]:
                 best = (x0, y, text)
         return best
@@ -487,14 +487,22 @@ def _multiline_match_positions(page, line_ys: list[float]) -> list[float | None]
         tok_n, the one at/after last_x if any, else the leftmost. Position
         is only a tie-break AMONG text-valid candidates — applying it
         before filtering by text let a wrong-text word that happened to
-        sit past last_x outrank the actual match sitting just behind it."""
+        sit past last_x outrank the actual match sitting just behind it.
+
+        The tie-break itself is nearest-by-distance, not "any candidate
+        at/after last_x beats any candidate before it" — that absolute
+        preference once let a candidate 80+ px ahead win over one sitting
+        naturally ~10px behind (both valid text matches, from different
+        lines), when the near one was actually the right reading-order
+        continuation and the far one belonged to a later column entirely.
+        """
         candidates = []
         for y in line_ys:
             i = ptr[y]
             words = lines[y]
             if i >= len(words):
                 continue
-            x0, text = words[i]
+            x0, _x1, text = words[i]
             nt = _norm_token(text)
             # A punctuation-only schema token (e.g. "/") normalizes to "" —
             # only match it against an equally punctuation-only word, never
@@ -503,8 +511,43 @@ def _multiline_match_positions(page, line_ys: list[float]) -> list[float | None]
                 candidates.append((x0, y, text))
         if not candidates:
             return None
-        candidates.sort(key=lambda c: (c[0] < last_x, c[0]))
+        candidates.sort(key=lambda c: abs(c[0] - last_x))
         return candidates[0]
+
+    def try_split(ptr: dict[float, int], tok_n: str, last_x: float):
+        """Last-resort match for two labels rendered as ONE real word with
+        no space at all between them (observed: "Year Of Manufacture" and
+        "Arrear Opening" fused into "...ManufactureArrear..." — a single
+        PyMuPDF word token, unlike the DelinquencyDay/"s" case where the
+        split was already two separate real words). tok_n only needs to be
+        a PREFIX of the word's text here, and the word is shrunk in place
+        (via linear interpolation across its pixel width, the same
+        technique _header_char_xs uses) to its unconsumed remainder rather
+        than being fully consumed, so the next schema token can claim the
+        rest of it. Only attempted when normalizing the word's text didn't
+        strip any characters, so the character offset lines up exactly —
+        otherwise the interpolated split point would be unreliable.
+        """
+        candidates = []
+        for y in line_ys:
+            i = ptr[y]
+            words = lines[y]
+            if i >= len(words):
+                continue
+            x0, x1, text = words[i]
+            nt = _norm_token(text)
+            if nt and nt != tok_n and nt.startswith(tok_n) and len(nt) == len(text):
+                candidates.append((x0, x1, y, i, text))
+        if not candidates:
+            return None
+        candidates.sort(key=lambda c: abs(c[0] - last_x))
+        x0, x1, y, i, text = candidates[0]
+        n = len(text)
+        split_at = len(tok_n)
+        width = x1 - x0
+        remainder_x0 = x0 + width * split_at / n
+        lines[y][i] = (remainder_x0, x1, text[split_at:])
+        return x0
 
     def consume_token(tok_n: str, ptr: dict[float, int], last_x: float,
                        max_skip: int = 2, max_words: int = 3):
@@ -522,30 +565,35 @@ def _multiline_match_positions(page, line_ys: list[float]) -> list[float | None]
                 break
 
             first = best_start(trial, tok_n, last_x)
-            if first is None:
-                continue
-            x0, y, text = first
-            acc_x = x0
-            acc = _norm_token(text)
-            trial[y] += 1
-            if acc == tok_n:
-                ptr.clear()
-                ptr.update(trial)
-                return acc_x
-
-            for _ in range(max_words - 1):
-                if not tok_n.startswith(acc):
-                    break
-                cand = smallest_next(trial)
-                if cand is None:
-                    break
-                _, y2, text2 = cand
-                acc += _norm_token(text2)
-                trial[y2] += 1
+            if first is not None:
+                x0, y, text = first
+                acc_x = x0
+                acc = _norm_token(text)
+                trial[y] += 1
                 if acc == tok_n:
                     ptr.clear()
                     ptr.update(trial)
                     return acc_x
+
+                for _ in range(max_words - 1):
+                    if not tok_n.startswith(acc):
+                        break
+                    cand = smallest_next(trial)
+                    if cand is None:
+                        break
+                    _, y2, text2 = cand
+                    acc += _norm_token(text2)
+                    trial[y2] += 1
+                    if acc == tok_n:
+                        ptr.clear()
+                        ptr.update(trial)
+                        return acc_x
+
+            split_x = try_split(trial, tok_n, last_x)
+            if split_x is not None:
+                ptr.clear()
+                ptr.update(trial)
+                return split_x
         return None
 
     ptr = {y: 0 for y in line_ys}
@@ -690,9 +738,16 @@ def _build_col_xs(header_items: list, header_char_xs: list[float],
         # the remaining genuine near-ties (e.g. a column whose value is
         # *always* two words, so both words are equally high-frequency —
         # only their order says which one is the true start).
+        #
+        # 0.6 is empirically the largest safe bias: swept 1.0 down to 0.01
+        # against known-good files, and anything below ~0.5 starts
+        # systematically shifting *already-correct* columns one cluster
+        # left too, since a large-but-cheaply-discounted leftward jump can
+        # then look artificially cheaper than a tiny, undiscounted
+        # rightward one.
         word_clusters = _data_word_clusters(word_row_map, header_y, min_freq_ratio=0.9)
         if word_clusters:
-            core_xs = _snap_to_data_clusters(core_xs, word_clusters, left_bias=0.01)
+            core_xs = _snap_to_data_clusters(core_xs, word_clusters, left_bias=0.6)
     else:
         word_clusters = _data_word_clusters(word_row_map, header_y)
         if word_clusters:
