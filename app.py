@@ -318,6 +318,85 @@ def _snap_to_data_clusters(xs: list[float], clusters: list[float],
     return [assign[i] if assign[i] is not None else xs[i] for i in range(n)]
 
 
+def _grid_col_xs(page, min_cols: int = 50) -> list[float] | None:
+    """
+    Column boundaries read directly from the PDF's own drawn table-cell
+    backgrounds, when present — ground truth from the document itself,
+    not inferred from text position at all. Every report template seen
+    so far renders each cell as its own filled rectangle, contiguous
+    left-to-right, identically laid out on every row including the
+    header — so the leftmost cell background on any representative row
+    gives exact column starts, sidestepping every ambiguity that made
+    text-position inference (header labels offset from data start,
+    multi-word values, fused header words, ...) so failure-prone.
+
+    Rows are grouped by their rectangles' top Y (rounded to survive tiny
+    float jitter); the row whose cell COUNT is most common across the
+    page is used, since an occasional row (a totals line, a merged
+    banner) can have a different count and shouldn't be mistaken for the
+    real grid. Returns None — falling back to text-position inference —
+    when the page has no such rectangles, or nothing resembling a full
+    table row (fewer than `min_cols` cells), since not every template is
+    guaranteed to draw one.
+    """
+    rows: dict[float, list[float]] = defaultdict(list)
+    for d in page.get_drawings():
+        rect = d.get("rect")
+        if rect is None:
+            continue
+        rows[round(rect.y0, 1)].append(rect.x0)
+    if not rows:
+        return None
+
+    counts: dict[int, int] = defaultdict(int)
+    for xs in rows.values():
+        counts[len(xs)] += 1
+    mode_count = max(counts, key=lambda c: counts[c])
+    if mode_count < min_cols:
+        return None
+
+    for y in sorted(rows):
+        if len(rows[y]) == mode_count:
+            return sorted(rows[y])
+    return None
+
+
+def _reclaim_unmatched_clusters(pre_snap_xs: list[float], snapped_xs: list[float],
+                                 clusters: list[float]) -> list[float]:
+    """
+    Second, narrower repair pass for columns _snap_to_data_clusters left
+    completely unmatched (no cluster was close enough even with the
+    leftward bias) — a distinct, safely-detectable failure signature from
+    a column that matched *something*, just the wrong one.
+
+    A left-unmatched column keeps its pre-snap value verbatim (see
+    _snap_to_data_clusters's fallback), so it's found by comparing the
+    two lists directly rather than needing the DP's internal state. For
+    each one, if there's exactly one still-unused cluster strictly
+    between its (already-resolved) neighbors, that's overwhelmingly
+    likely to be this column's true position — a real column's edge is
+    high-frequency and reliably lands nearby; anything else there would
+    already have been claimed. Deliberately narrow (only a lone, isolated
+    candidate) and self-limiting (a genuinely wrong reassignment would
+    just as often collide with a neighbor as fix anything, and "exactly
+    one, isolated" makes that rare) — processed left to right so an
+    earlier fix's corrected position becomes the next column's boundary.
+    """
+    result = list(snapped_xs)
+    used = set(result)
+    n = len(result)
+    for i in range(n):
+        if result[i] != pre_snap_xs[i]:
+            continue  # matched to something already; not our concern here
+        prev_x = result[i - 1] if i > 0 else float("-inf")
+        next_x = result[i + 1] if i + 1 < n else float("inf")
+        between = [c for c in clusters if prev_x < c < next_x and c not in used]
+        if len(between) == 1:
+            result[i] = between[0]
+            used.add(between[0])
+    return result
+
+
 def _header_words(page, header_y: float) -> list[tuple[float, str]]:
     """Word-level (left, text) tokens for the header row, sorted by X.
 
@@ -747,7 +826,9 @@ def _build_col_xs(header_items: list, header_char_xs: list[float],
         # rightward one.
         word_clusters = _data_word_clusters(word_row_map, header_y, min_freq_ratio=0.9)
         if word_clusters:
+            pre_snap = core_xs
             core_xs = _snap_to_data_clusters(core_xs, word_clusters, left_bias=0.6)
+            core_xs = _reclaim_unmatched_clusters(pre_snap, core_xs, word_clusters)
     else:
         word_clusters = _data_word_clusters(word_row_map, header_y)
         if word_clusters:
@@ -857,23 +938,33 @@ def pdf_to_dataframe(file_bytes: bytes) -> pd.DataFrame:
         if page_header_items is not None and col_xs is None:
             page_header_words = _header_words(page, page_header_y)
 
-            # Some templates wrap long labels across several stacked header
-            # lines rather than one (or one fused) line — detect that and
-            # resolve column positions by text-matching EXPECTED_COLS
-            # against the real header words directly, since a wrapped
-            # line's word can start to the left of the line above it for
-            # the same column, which breaks any position-only approach.
-            line_ys = _header_line_ys(page, page_header_y)
-            precomputed_core_xs = None
-            if len(line_ys) > 1:
-                positions = _multiline_match_positions(page, line_ys)
-                if any(p is not None for p in positions):
-                    precomputed_core_xs = _fill_multiline_positions(positions)
-            page_header_char_xs, page_header_word_starts = _header_char_xs(page, page_header_y)
+            # Ground truth first: many templates draw each cell as its own
+            # background rectangle, identically laid out on every row, which
+            # sidesteps every text-position ambiguity below entirely. Only
+            # fall back to inferring positions from text when a page has no
+            # such grid.
+            col_xs = _grid_col_xs(page)
 
-            col_xs = _build_col_xs(page_header_items, page_header_char_xs, page_header_word_starts,
-                                    row_map, word_row_map, page_header_y,
-                                    precomputed_core_xs=precomputed_core_xs)
+            if col_xs is None:
+                # Some templates wrap long labels across several stacked
+                # header lines rather than one (or one fused) line — detect
+                # that and resolve column positions by text-matching
+                # EXPECTED_COLS against the real header words directly,
+                # since a wrapped line's word can start to the left of the
+                # line above it for the same column, which breaks any
+                # position-only approach.
+                line_ys = _header_line_ys(page, page_header_y)
+                precomputed_core_xs = None
+                if len(line_ys) > 1:
+                    positions = _multiline_match_positions(page, line_ys)
+                    if any(p is not None for p in positions):
+                        precomputed_core_xs = _fill_multiline_positions(positions)
+                page_header_char_xs, page_header_word_starts = _header_char_xs(page, page_header_y)
+
+                col_xs = _build_col_xs(page_header_items, page_header_char_xs, page_header_word_starts,
+                                        row_map, word_row_map, page_header_y,
+                                        precomputed_core_xs=precomputed_core_xs)
+
             col_names = _resolve_col_names(page_header_words, col_xs)
 
         if col_xs is None:
