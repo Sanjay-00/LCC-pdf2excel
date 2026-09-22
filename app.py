@@ -318,7 +318,9 @@ def _snap_to_data_clusters(xs: list[float], clusters: list[float],
     return [assign[i] if assign[i] is not None else xs[i] for i in range(n)]
 
 
-def _grid_col_xs(page, min_cols: int = 50) -> list[float] | None:
+def _grid_col_xs(page, header_items: list | None = None,
+                  min_cols: int = 50, min_header_match_ratio: float = 0.6,
+                  header_match_tol: float = 15.0) -> list[float] | None:
     """
     Column boundaries read directly from the PDF's own drawn table-cell
     backgrounds, when present — ground truth from the document itself,
@@ -338,6 +340,16 @@ def _grid_col_xs(page, min_cols: int = 50) -> list[float] | None:
     when the page has no such rectangles, or nothing resembling a full
     table row (fewer than `min_cols` cells), since not every template is
     guaranteed to draw one.
+
+    Sanity-checked against the header row's real text before being
+    trusted: real header words should be sitting right at (or very near)
+    these boundaries, since this is meant to be the same row. If most of
+    them aren't — the mode-count row was some other, unrelated grid of
+    rectangles a page happens to contain (a logo, a legend, an unrelated
+    box), or this page's rectangles simply aren't a real header/data
+    grid at all — the result is discarded rather than silently trusted,
+    since a wrong grid would be *more* confidently wrong than the
+    text-inference fallback it's meant to improve on.
     """
     rows: dict[float, list[float]] = defaultdict(list)
     for d in page.get_drawings():
@@ -355,10 +367,23 @@ def _grid_col_xs(page, min_cols: int = 50) -> list[float] | None:
     if mode_count < min_cols:
         return None
 
+    grid_xs = None
     for y in sorted(rows):
         if len(rows[y]) == mode_count:
-            return sorted(rows[y])
-    return None
+            grid_xs = sorted(rows[y])
+            break
+    if grid_xs is None:
+        return None
+
+    if header_items:
+        hits = sum(
+            1 for x, _ in header_items
+            if any(abs(x - cx) <= header_match_tol for cx in grid_xs)
+        )
+        if hits / len(header_items) < min_header_match_ratio:
+            return None
+
+    return grid_xs
 
 
 def _reclaim_unmatched_clusters(pre_snap_xs: list[float], snapped_xs: list[float],
@@ -943,7 +968,7 @@ def pdf_to_dataframe(file_bytes: bytes) -> pd.DataFrame:
             # sidesteps every text-position ambiguity below entirely. Only
             # fall back to inferring positions from text when a page has no
             # such grid.
-            col_xs = _grid_col_xs(page)
+            col_xs = _grid_col_xs(page, header_items=page_header_items)
 
             if col_xs is None:
                 # Some templates wrap long labels across several stacked
